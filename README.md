@@ -11,8 +11,10 @@ Zero configuration — works out of the box even if PostgreSQL is not installed 
 
 ## Installation
 
+The package is currently available only from GitHub (not yet on PyPI).
+
 ```bash
-pip install embedded-postgres
+pip install git+https://github.com/piotr-rudnik/embedded-postgres.git
 ```
 
 Or add to your project's dependencies::
@@ -21,7 +23,7 @@ Or add to your project's dependencies::
 # pyproject.toml
 [project]
 dependencies = [
-    "embedded-postgres",
+    "embedded-postgres @ git+https://github.com/piotr-rudnik/embedded-postgres.git",
 ]
 ```
 
@@ -196,7 +198,7 @@ Add ``embedded-postgres`` to your ``pyproject.toml`` dependencies::
 
 ```toml
 dependencies = [
-    "embedded-postgres",
+    "embedded-postgres @ git+https://github.com/piotr-rudnik/embedded-postgres.git",
 ]
 ```
 
@@ -205,7 +207,7 @@ For development / test-only usage::
 ```toml
 [project.optional-dependencies]
 test = [
-    "embedded-postgres",
+    "embedded-postgres @ git+https://github.com/piotr-rudnik/embedded-postgres.git",
     "pytest",
 ]
 ```
