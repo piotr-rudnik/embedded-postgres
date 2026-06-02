@@ -1,7 +1,9 @@
 """Core implementation for EmbeddedPostgres."""
 
 import atexit
+import glob
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -60,6 +62,8 @@ class EmbeddedPostgres:
         self._actual_port: Optional[int] = None
         self._bin_dir: Optional[Path] = None
         self._running = False
+        self._postmaster_pid: Optional[int] = None
+        self._atexit_registered = False
 
     @staticmethod
     def _find_system_binaries() -> Optional[Path]:
@@ -197,6 +201,17 @@ class EmbeddedPostgres:
         # Wait for server to accept connections
         self._wait_for_server()
 
+        # Track the actual postmaster PID for reliable force-kill
+        pid_file = os.path.join(self._actual_data_dir, "postmaster.pid")
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file) as f:
+                    line = f.readline().strip()
+                    if line.isdigit():
+                        self._postmaster_pid = int(line)
+            except (OSError, ValueError):
+                pass
+
     def _ensure_database_exists(self) -> None:
         """Create the requested default database if it is not the superuser DB."""
         if self._database == self._username:
@@ -252,6 +267,8 @@ class EmbeddedPostgres:
         self._bin_dir = self._find_binaries()
 
         if self._data_dir is None:
+            # Pre-clean any orphaned temp dirs from crashed runs
+            EmbeddedPostgres.cleanup_orphans()
             self._actual_data_dir = tempfile.mkdtemp(prefix="inmemory_pg_")
         else:
             self._actual_data_dir = os.path.abspath(self._data_dir)
@@ -267,7 +284,9 @@ class EmbeddedPostgres:
             self._start_postgres()
             self._ensure_database_exists()
             self._running = True
-            atexit.register(self.stop)
+            if not self._atexit_registered:
+                atexit.register(self.stop)
+                self._atexit_registered = True
         except Exception:
             self._cleanup()
             raise
@@ -279,33 +298,77 @@ class EmbeddedPostgres:
         if not self._running:
             return
 
+        # Unregister atexit handler to prevent double-stop
+        if self._atexit_registered:
+            try:
+                atexit.unregister(self.stop)
+            except Exception:
+                pass
+            self._atexit_registered = False
+
+        stopped = False
+
         try:
-            if self._process is not None:
-                self._process.terminate()
+            # Strategy 1: clean shutdown via pg_ctl or direct process
+            try:
+                if self._process is not None:
+                    self._process.terminate()
+                    try:
+                        self._process.wait(timeout=5)
+                        stopped = True
+                    except subprocess.TimeoutExpired:
+                        self._process.kill()
+                        self._process.wait()
+                        stopped = True
+                    self._process = None
+                elif self._bin_dir and os.path.exists(self._bin("pg_ctl")):
+                    env = os.environ.copy()
+                    env["PGPORT"] = str(self._actual_port)
+                    result = subprocess.run(
+                        [
+                            self._bin("pg_ctl"),
+                            "stop",
+                            "--pgdata", self._actual_data_dir,
+                            "--mode", "immediate",
+                            "--wait",
+                        ],
+                        capture_output=True,
+                        check=False,
+                        env=env,
+                    )
+                    stopped = result.returncode == 0
+            except Exception:
+                pass
+
+            # Strategy 2: force-kill by postmaster PID (handles orphaned processes)
+            if not stopped and self._postmaster_pid is not None:
                 try:
-                    self._process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    self._process.wait()
-                self._process = None
-            elif self._bin_dir and os.path.exists(self._bin("pg_ctl")):
-                env = os.environ.copy()
-                env["PGPORT"] = str(self._actual_port)
-                subprocess.run(
-                    [
-                        self._bin("pg_ctl"),
-                        "stop",
-                        "--pgdata", self._actual_data_dir,
-                        "--mode", "fast",
-                        "--wait",
-                    ],
-                    capture_output=True,
-                    check=False,
-                    env=env,
-                )
+                    os.kill(self._postmaster_pid, signal.SIGKILL)
+                    # Give it a moment to die
+                    for _ in range(50):
+                        try:
+                            os.kill(self._postmaster_pid, 0)
+                            time.sleep(0.1)
+                        except OSError:
+                            stopped = True
+                            break
+                except (OSError, PermissionError):
+                    pass
+
+            # Strategy 3: pg_ctl stop --mode immediate as last resort
+            if not stopped and self._bin_dir and os.path.exists(self._bin("pg_ctl")):
+                try:
+                    subprocess.run(
+                        [self._bin("pg_ctl"), "stop", "--pgdata", self._actual_data_dir,
+                         "--mode", "immediate"],
+                        capture_output=True, check=False, timeout=10,
+                    )
+                except Exception:
+                    pass
         finally:
             self._cleanup()
             self._running = False
+            self._postmaster_pid = None
 
     def _cleanup(self) -> None:
         """Remove the temporary data directory."""
@@ -317,6 +380,43 @@ class EmbeddedPostgres:
             except Exception:
                 pass
         self._actual_data_dir = None
+
+    @staticmethod
+    def cleanup_orphans() -> None:
+        """Kill orphaned postmasters and remove leftover data dirs.
+
+        Scans temp dirs left by crashed or SIGKILL'd runs, kills the
+        postmaster process, and removes the data directory.
+        """
+        for data_dir in glob.glob(tempfile.gettempdir() + "/inmemory_pg_*"):
+            pid_file = os.path.join(data_dir, "postmaster.pid")
+            if not os.path.exists(pid_file):
+                # No pid file means initdb didn't complete — just clean the dir
+                shutil.rmtree(data_dir, ignore_errors=True)
+                continue
+
+            try:
+                with open(pid_file) as f:
+                    line = f.readline().strip()
+                    if line.isdigit():
+                        pid = int(line)
+                        # Check if process exists
+                        try:
+                            os.kill(pid, 0)
+                            # It's alive — kill it
+                            os.kill(pid, signal.SIGKILL)
+                            for _ in range(50):
+                                try:
+                                    os.kill(pid, 0)
+                                    time.sleep(0.1)
+                                except OSError:
+                                    break
+                        except (OSError, PermissionError):
+                            pass  # Already dead
+            except (OSError, ValueError):
+                pass
+            finally:
+                shutil.rmtree(data_dir, ignore_errors=True)
 
     def url(self, database: Optional[str] = None) -> str:
         """Return a psycopg2-compatible connection URL.
@@ -357,4 +457,9 @@ class EmbeddedPostgres:
         self.stop()
 
     def __del__(self):
-        self.stop()
+        # Guard against interpreter shutdown where globals may be None
+        try:
+            self.stop()
+        except (TypeError, AttributeError, OSError):
+            # During interpreter shutdown os.kill, subprocess etc. may be None
+            pass
