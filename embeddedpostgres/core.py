@@ -383,39 +383,41 @@ class EmbeddedPostgres:
 
     @staticmethod
     def cleanup_orphans() -> None:
-        """Kill orphaned postmasters and remove leftover data dirs.
+        """Remove orphaned temp dirs from crashed or SIGKILL'd runs.
 
-        Scans temp dirs left by crashed or SIGKILL'd runs, kills the
-        postmaster process, and removes the data directory.
+        Only removes directories whose postmaster process is confirmed
+        dead.  If the postmaster is still alive the directory is assumed
+        to be in use by another process (e.g. a parallel test worker)
+        and is left untouched.
         """
         for data_dir in glob.glob(tempfile.gettempdir() + "/inmemory_pg_*"):
             pid_file = os.path.join(data_dir, "postmaster.pid")
             if not os.path.exists(pid_file):
-                # No pid file means initdb didn't complete — just clean the dir
-                shutil.rmtree(data_dir, ignore_errors=True)
+                # No pid file — dir may be mid-initdb by another worker; skip
                 continue
 
+            orphaned = False
             try:
                 with open(pid_file) as f:
                     line = f.readline().strip()
                     if line.isdigit():
                         pid = int(line)
-                        # Check if process exists
                         try:
                             os.kill(pid, 0)
-                            # It's alive — kill it
-                            os.kill(pid, signal.SIGKILL)
-                            for _ in range(50):
-                                try:
-                                    os.kill(pid, 0)
-                                    time.sleep(0.1)
-                                except OSError:
-                                    break
-                        except (OSError, PermissionError):
-                            pass  # Already dead
+                            # Process is alive — leave it (in use by another worker)
+                        except OSError:
+                            # Process is dead — safe to clean
+                            orphaned = True
+                        except PermissionError:
+                            # Can't check — leave it
+                            pass
+                    else:
+                        # Invalid pid file — orphaned
+                        orphaned = True
             except (OSError, ValueError):
-                pass
-            finally:
+                continue
+
+            if orphaned:
                 shutil.rmtree(data_dir, ignore_errors=True)
 
     def url(self, database: Optional[str] = None) -> str:
