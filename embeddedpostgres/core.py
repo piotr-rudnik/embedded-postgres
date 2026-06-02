@@ -267,8 +267,6 @@ class EmbeddedPostgres:
         self._bin_dir = self._find_binaries()
 
         if self._data_dir is None:
-            # Pre-clean any orphaned temp dirs from crashed runs
-            EmbeddedPostgres.cleanup_orphans()
             self._actual_data_dir = tempfile.mkdtemp(prefix="inmemory_pg_")
         else:
             self._actual_data_dir = os.path.abspath(self._data_dir)
