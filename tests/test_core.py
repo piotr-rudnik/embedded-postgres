@@ -139,3 +139,49 @@ class TestUrlAndDsn:
             assert dsn["user"] == "postgres"
             assert dsn["password"] == "postgres"
             assert dsn["dbname"] == "postgres"
+
+
+class TestMinimalConfig:
+    def test_minimal_config_applied_by_default(self):
+        """PostgreSQL should start with minimal shared memory settings."""
+        with EmbeddedPostgres() as pg:
+            conn = psycopg2.connect(pg.url())
+            cur = conn.cursor()
+            cur.execute("SHOW shared_buffers;")
+            assert cur.fetchone()[0] == "512kB"
+            cur.execute("SHOW max_connections;")
+            assert cur.fetchone()[0] == "5"
+            cur.execute("SHOW autovacuum;")
+            assert cur.fetchone()[0] == "off"
+            cur.execute("SHOW max_wal_senders;")
+            assert cur.fetchone()[0] == "0"
+            cur.execute("SHOW max_worker_processes;")
+            assert cur.fetchone()[0] == "0"
+            cur.execute("SHOW fsync;")
+            assert cur.fetchone()[0] == "off"
+            cur.execute("SHOW full_page_writes;")
+            assert cur.fetchone()[0] == "off"
+            cur.close()
+            conn.close()
+
+    def test_minimal_config_can_be_disabled(self):
+        """When minimal_config=False, defaults should be used."""
+        with EmbeddedPostgres(minimal_config=False) as pg:
+            conn = psycopg2.connect(pg.url())
+            cur = conn.cursor()
+            # Default shared_buffers is typically 128MB, certainly not 512kB
+            cur.execute("SHOW shared_buffers;")
+            assert cur.fetchone()[0] != "512kB"
+            cur.close()
+            conn.close()
+
+    def test_postgresql_conf_file_exists(self):
+        """The config file should be written to the data directory."""
+        with EmbeddedPostgres() as pg:
+            conf_path = os.path.join(pg._actual_data_dir, "postgresql.conf")
+            assert os.path.exists(conf_path)
+            with open(conf_path) as f:
+                content = f.read()
+            assert "shared_buffers = 512kB" in content
+            assert "dynamic_shared_memory_type" in content
+            assert "max_connections = 5" in content

@@ -48,6 +48,7 @@ class EmbeddedPostgres:
         database: str = "postgres",
         version: Optional[str] = None,
         pg_bin_dir: Optional[str] = None,
+        minimal_config: bool = True,
     ):
         self._data_dir = data_dir
         self._port = port
@@ -56,6 +57,7 @@ class EmbeddedPostgres:
         self._database = database
         self._version = version
         self._pg_bin_dir = pg_bin_dir
+        self._minimal_config = minimal_config
 
         self._process: Optional[subprocess.Popen] = None
         self._actual_data_dir: Optional[str] = None
@@ -154,6 +156,40 @@ class EmbeddedPostgres:
         )
         if result.returncode != 0:
             raise RuntimeError(f"initdb failed: {result.stderr}")
+
+    def _write_postgresql_conf(self) -> None:
+        """Append minimal-memory settings to postgresql.conf after initdb.
+
+        This dramatically reduces shared-memory usage so many
+        ephemeral instances can run side by side without
+        exhausting /dev/shm.  It is safe for testing but
+        should NOT be used for production workloads.
+        """
+        if not self._minimal_config:
+            return
+
+        conf_path = os.path.join(self._actual_data_dir, "postgresql.conf")
+
+        # Platform-appropriate shared-memory allocation strategy.
+        # Linux prefers posix (System V shared memory), macOS
+        # needs mmap because its kern.sysv.shmmax is tiny by
+        # default.
+        if os.uname().sysname == "Darwin":
+            dynamic_shared_memory_type = "mmap"
+        else:
+            dynamic_shared_memory_type = "posix"
+
+        with open(conf_path, "a") as f:
+            f.write("\n# Patched for minimal shared memory usage\n")
+            f.write("shared_buffers = 512kB\n")
+            f.write(f"dynamic_shared_memory_type = {dynamic_shared_memory_type}\n")
+            f.write("max_connections = 5\n")
+            f.write("max_wal_senders = 0\n")
+            f.write("max_worker_processes = 0\n")
+            f.write("autovacuum = off\n")
+            f.write("wal_level = minimal\n")
+            f.write("fsync = off\n")
+            f.write("full_page_writes = off\n")
 
     def _start_postgres(self) -> None:
         """Start the PostgreSQL server process."""
@@ -279,6 +315,7 @@ class EmbeddedPostgres:
 
         try:
             self._initdb()
+            self._write_postgresql_conf()
             self._start_postgres()
             self._ensure_database_exists()
             self._running = True
